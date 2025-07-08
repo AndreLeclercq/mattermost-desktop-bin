@@ -1,0 +1,82 @@
+name: Update AUR Package
+
+on:
+  schedule:
+    - cron: '0 9 * * *'
+  workflow_dispatch:
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Check for updates
+      id: check
+      run: |
+        CURRENT=$(grep "pkgver=" PKGBUILD | cut -d'=' -f2)
+        LATEST=$(curl -s https://api.github.com/repos/mattermost/desktop/releases/latest | grep '"tag_name"' | cut -d'"' -f4 | sed 's/^v//')
+        
+        if [ "$CURRENT" != "$LATEST" ]; then
+          echo "update=true" >> $GITHUB_OUTPUT
+          echo "version=$LATEST" >> $GITHUB_OUTPUT
+          
+          # Get SHA256
+          wget -q "https://releases.mattermost.com/desktop/$LATEST/mattermost-desktop-$LATEST-linux-x64.tar.gz"
+          SHA256=$(sha256sum mattermost-desktop-$LATEST-linux-x64.tar.gz | cut -d' ' -f1)
+          echo "sha256=$SHA256" >> $GITHUB_OUTPUT
+          
+          # Update PKGBUILD
+          sed -i "s/pkgver=.*/pkgver=$LATEST/" PKGBUILD
+          sed -i "s/pkgrel=.*/pkgrel=1/" PKGBUILD
+          sed -i "s/sha256sums=.*/sha256sums=('$SHA256')/" PKGBUILD
+        fi
+    
+    - name: Update GitHub repo
+      if: steps.check.outputs.update == 'true'
+      run: |
+        git config user.name "GitHub Action"
+        git config user.email "action@github.com"
+        git add PKGBUILD
+        git commit -m "Update to ${{ steps.check.outputs.version }}"
+        git push
+    
+    - name: Setup SSH and push to AUR
+      if: steps.check.outputs.update == 'true'
+      run: |
+        mkdir -p ~/.ssh
+        echo "${{ secrets.AUR_SSH_KEY }}" > ~/.ssh/aur
+        chmod 600 ~/.ssh/aur
+        ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts
+        
+        # Clone AUR repo
+        git clone ssh://aur@aur.archlinux.org/mattermost-desktop-bin.git aur-repo
+        cd aur-repo
+        
+        # Copy updated files
+        cp ../PKGBUILD .
+        
+        # Generate .SRCINFO
+        sudo apt-get update && sudo apt-get install -y devscripts
+        source PKGBUILD
+        cat > .SRCINFO << EOF
+        pkgbase = mattermost-desktop-bin
+        	pkgver = ${{ steps.check.outputs.version }}
+        	pkgrel = 1
+        	pkgdesc = Mattermost Desktop application (precompiled binary)
+        	arch = x86_64
+        	url = https://mattermost.com/
+        	license = Apache-2.0
+        	source = mattermost-desktop-${{ steps.check.outputs.version }}-linux-x64.tar.gz::https://releases.mattermost.com/desktop/${{ steps.check.outputs.version }}/mattermost-desktop-${{ steps.check.outputs.version }}-linux-x64.tar.gz
+        	sha256sums = ${{ steps.check.outputs.sha256 }}
+        
+        pkgname = mattermost-desktop-bin
+        EOF
+        
+        # Push to AUR
+        git config user.name "${{ secrets.USER_NAME }}"
+        git config user.email "${{ secrets.USER_EMAIL }}"
+        git add PKGBUILD .SRCINFO
+        git commit -m "Update to ${{ steps.check.outputs.version }}"
+        GIT_SSH_COMMAND="ssh -i ~/.ssh/aur" git push origin master
