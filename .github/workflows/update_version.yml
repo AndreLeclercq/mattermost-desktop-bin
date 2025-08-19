@@ -1,5 +1,4 @@
-name: Update AUR Package
-
+name: Update AUR Package (Robust)
 on:
   schedule:
     - cron: '0 9 * * *'
@@ -21,65 +20,135 @@ jobs:
         CURRENT=$(grep "pkgver=" PKGBUILD | cut -d'=' -f2)
         LATEST=$(curl -s https://api.github.com/repos/mattermost/desktop/releases/latest | grep '"tag_name"' | cut -d'"' -f4 | sed 's/^v//')
         
+        echo "Current version: $CURRENT"
+        echo "Latest version: $LATEST"
+        
         if [ "$CURRENT" != "$LATEST" ]; then
-          echo "update=true" >> $GITHUB_OUTPUT
+          echo "✅ Update available: $CURRENT → $LATEST"
+          echo "update_available=true" >> $GITHUB_OUTPUT
           echo "version=$LATEST" >> $GITHUB_OUTPUT
           
-          # Get SHA256
+          # Préparer le SHA256 pour plus tard
+          echo "📥 Downloading archive for SHA256..."
           wget -q "https://releases.mattermost.com/desktop/$LATEST/mattermost-desktop-$LATEST-linux-x64.tar.gz"
           SHA256=$(sha256sum mattermost-desktop-$LATEST-linux-x64.tar.gz | cut -d' ' -f1)
+          echo "SHA256: $SHA256"
           echo "sha256=$SHA256" >> $GITHUB_OUTPUT
-          
-          # Update PKGBUILD
-          sed -i "s/pkgver=.*/pkgver=$LATEST/" PKGBUILD
-          sed -i "s/pkgrel=.*/pkgrel=1/" PKGBUILD
-          sed -i "s/sha256sums=.*/sha256sums=('$SHA256')/" PKGBUILD
+        else
+          echo "ℹ️ No update needed"
+          echo "update_available=false" >> $GITHUB_OUTPUT
         fi
     
-    - name: Update GitHub repo
-      if: steps.check.outputs.update == 'true'
+    - name: Validate AUR SSH connection
+      id: validate_aur
+      if: steps.check.outputs.update_available == 'true'
       run: |
+        echo "🔧 Testing AUR SSH connection BEFORE making any changes..."
+        
+        mkdir -p ~/.ssh
+        cat > ~/.ssh/aur << 'EOF'
+        ${{ secrets.AUR_SSH_KEY }}
+        EOF
+        chmod 600 ~/.ssh/aur
+        ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts
+        
+        echo "🔍 Testing SSH authentication..."
+        if ssh -i ~/.ssh/aur -o StrictHostKeyChecking=no -o ConnectTimeout=10 -T aur@aur.archlinux.org 2>&1 | grep -q "Welcome to AUR"; then
+          echo "✅ SSH connection to AUR successful!"
+          echo "aur_accessible=true" >> $GITHUB_OUTPUT
+        else
+          echo "❌ SSH connection to AUR failed!"
+          echo "aur_accessible=false" >> $GITHUB_OUTPUT
+          exit 1
+        fi
+        
+        echo "🔍 Testing git clone access..."
+        export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur -o StrictHostKeyChecking=no -o ConnectTimeout=10"
+        
+        if timeout 30 git clone ssh://aur@aur.archlinux.org/mattermost-desktop-bin.git aur-test 2>/dev/null; then
+          echo "✅ Git clone test successful!"
+          rm -rf aur-test
+          echo "aur_clone_ok=true" >> $GITHUB_OUTPUT
+        else
+          echo "❌ Git clone test failed!"
+          echo "aur_clone_ok=false" >> $GITHUB_OUTPUT
+          exit 1
+        fi
+        
+        echo "🎉 All AUR connectivity tests passed!"
+    
+    - name: Update PKGBUILD and commit to GitHub
+      if: steps.check.outputs.update_available == 'true' && steps.validate_aur.outputs.aur_accessible == 'true'
+      run: |
+        echo "🔄 AUR is accessible, proceeding with PKGBUILD update..."
+        
+        sed -i "s/pkgver=.*/pkgver=${{ steps.check.outputs.version }}/" PKGBUILD
+        sed -i "s/pkgrel=.*/pkgrel=1/" PKGBUILD
+        sed -i "s/sha256sums=.*/sha256sums=('${{ steps.check.outputs.sha256 }}')/" PKGBUILD
+        
+        echo "📋 Updated PKGBUILD:"
+        echo "---"
+        cat PKGBUILD
+        echo "---"
+        
         git config user.name "GitHub Action"
         git config user.email "action@github.com"
         git add PKGBUILD
         git commit -m "Update to ${{ steps.check.outputs.version }}"
         git push
-    
-    - name: Setup SSH and push to AUR
-      if: steps.check.outputs.update == 'true'
-      run: |
-        mkdir -p ~/.ssh
-        echo "${{ secrets.AUR_SSH_KEY }}" > ~/.ssh/aur
-        chmod 600 ~/.ssh/aur
-        ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts
         
-        # Clone AUR repo
+        echo "✅ GitHub repository updated to ${{ steps.check.outputs.version }}"
+    
+    - name: Push to AUR
+      if: steps.check.outputs.update_available == 'true' && steps.validate_aur.outputs.aur_accessible == 'true'
+      run: |
+        echo "🚀 Pushing to AUR (SSH already validated)..."
+        
+        export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur -o StrictHostKeyChecking=no -o UserKnownHostsFile=~/.ssh/known_hosts"
+        
         git clone ssh://aur@aur.archlinux.org/mattermost-desktop-bin.git aur-repo
         cd aur-repo
         
-        # Copy updated files
+        echo "📋 Current AUR version: $(grep 'pkgver =' .SRCINFO | cut -d' ' -f3)"
+        
         cp ../PKGBUILD .
         
-        # Generate .SRCINFO
-        sudo apt-get update && sudo apt-get install -y devscripts
-        source PKGBUILD
         cat > .SRCINFO << EOF
         pkgbase = mattermost-desktop-bin
+        	pkgdesc = Mattermost Desktop application (precompiled binary)
         	pkgver = ${{ steps.check.outputs.version }}
         	pkgrel = 1
-        	pkgdesc = Mattermost Desktop application (precompiled binary)
-        	arch = x86_64
         	url = https://mattermost.com/
+        	arch = x86_64
         	license = Apache-2.0
         	source = mattermost-desktop-${{ steps.check.outputs.version }}-linux-x64.tar.gz::https://releases.mattermost.com/desktop/${{ steps.check.outputs.version }}/mattermost-desktop-${{ steps.check.outputs.version }}-linux-x64.tar.gz
         	sha256sums = ${{ steps.check.outputs.sha256 }}
-        
+
         pkgname = mattermost-desktop-bin
         EOF
-        
-        # Push to AUR
+
         git config user.name "${{ secrets.USER_NAME }}"
         git config user.email "${{ secrets.USER_EMAIL }}"
         git add PKGBUILD .SRCINFO
         git commit -m "Update to ${{ steps.check.outputs.version }}"
-        GIT_SSH_COMMAND="ssh -i ~/.ssh/aur" git push origin master
+        git push origin master
+        
+        echo "🎉 Successfully updated AUR package to ${{ steps.check.outputs.version }}!"
+    
+    - name: Summary
+      if: always()
+      run: |
+        echo "=== WORKFLOW SUMMARY ==="
+        echo "Update available: ${{ steps.check.outputs.update_available }}"
+        if [ "${{ steps.check.outputs.update_available }}" = "true" ]; then
+          echo "New version: ${{ steps.check.outputs.version }}"
+          echo "AUR accessible: ${{ steps.validate_aur.outputs.aur_accessible }}"
+          if [ "${{ steps.validate_aur.outputs.aur_accessible }}" = "true" ]; then
+            echo "✅ Update completed successfully!"
+          else
+            echo "❌ Update failed: AUR not accessible"
+          fi
+        else
+          echo "ℹ️ No update was needed"
+        fi
+        echo "========================"
