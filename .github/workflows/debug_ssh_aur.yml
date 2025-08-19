@@ -1,0 +1,89 @@
+name: Debug SSH for AUR
+on:
+  workflow_dispatch:
+
+jobs:
+  debug-ssh:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Debug SSH Key and Connection
+      run: |
+        echo "🔧 Setting up SSH for debugging..."
+        
+        # Configuration SSH
+        mkdir -p ~/.ssh
+        
+        # Méthode alternative pour éviter les problèmes de retours à la ligne
+        cat > ~/.ssh/aur << 'EOF'
+        ${{ secrets.AUR_SSH_KEY }}
+        EOF
+        
+        chmod 600 ~/.ssh/aur
+        
+        # Debug : informations sur la clé
+        echo "📋 SSH Key Analysis:"
+        echo "- Key file size: $(wc -c < ~/.ssh/aur) bytes"
+        echo "- Key file lines: $(wc -l < ~/.ssh/aur) lines"
+        echo "- First line: $(head -1 ~/.ssh/aur)"
+        echo "- Last line: $(tail -1 ~/.ssh/aur)"
+        echo "- Key type detection:"
+        if grep -q "BEGIN OPENSSH PRIVATE KEY" ~/.ssh/aur; then
+          echo "  ✅ OpenSSH format detected"
+        elif grep -q "BEGIN RSA PRIVATE KEY" ~/.ssh/aur; then
+          echo "  ✅ RSA format detected"
+        elif grep -q "BEGIN EC PRIVATE KEY" ~/.ssh/aur; then
+          echo "  ✅ EC format detected"
+        else
+          echo "  ❌ Unknown key format"
+        fi
+        
+        # Vérifier les permissions
+        echo "- File permissions: $(ls -la ~/.ssh/aur)"
+        
+        # Configuration known_hosts
+        ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts
+        echo "✅ Added AUR to known_hosts"
+        
+        # Configuration SSH alternative - essayer plusieurs méthodes
+        echo "🔍 Testing SSH connection (Method 1 - Direct)..."
+        ssh -i ~/.ssh/aur -o StrictHostKeyChecking=no -o UserKnownHostsFile=~/.ssh/known_hosts -T aur@aur.archlinux.org 2>&1 || echo "Method 1 failed"
+        
+        echo ""
+        echo "🔍 Testing SSH connection (Method 2 - Verbose)..."
+        ssh -v -i ~/.ssh/aur -o StrictHostKeyChecking=no -o UserKnownHostsFile=~/.ssh/known_hosts -T aur@aur.archlinux.org 2>&1 | head -20 || echo "Method 2 completed"
+        
+        echo ""
+        echo "🔍 Testing SSH connection (Method 3 - Alternative config)..."
+        
+        # Créer un fichier de config SSH
+        cat > ~/.ssh/config << 'SSHEOF'
+        Host aur.archlinux.org
+          HostName aur.archlinux.org
+          User aur
+          Port 22
+          IdentityFile ~/.ssh/aur
+          IdentitiesOnly yes
+          StrictHostKeyChecking no
+          UserKnownHostsFile ~/.ssh/known_hosts
+        SSHEOF
+        
+        chmod 600 ~/.ssh/config
+        
+        ssh -T aur@aur.archlinux.org 2>&1 || echo "Method 3 failed"
+        
+        echo ""
+        echo "🔍 Testing git clone..."
+        
+        # Test avec git clone
+        export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur -o StrictHostKeyChecking=no -o UserKnownHostsFile=~/.ssh/known_hosts"
+        
+        # Essayer de cloner (timeout après 30s)
+        timeout 30 git clone ssh://aur@aur.archlinux.org/mattermost-desktop-bin.git test-repo 2>&1 || echo "Git clone test completed"
+        
+        if [ -d "test-repo" ]; then
+          echo "✅ Git clone successful!"
+          ls -la test-repo/
+        else
+          echo "❌ Git clone failed"
+        fi
