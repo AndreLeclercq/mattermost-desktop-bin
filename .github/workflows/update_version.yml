@@ -1,4 +1,4 @@
-name: Update AUR Package (Robust)
+name: Update AUR Package
 on:
   schedule:
     - cron: '0 9 * * *'
